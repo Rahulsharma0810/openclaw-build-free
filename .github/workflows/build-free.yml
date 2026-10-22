@@ -1,0 +1,238 @@
+name: Build Free OpenClaw Client (macOS arm64, unsigned)
+run-name: Build Free OpenClaw Client v${{ github.event.inputs.version || 'auto' }}
+
+# Builds an installable, ad-hoc-signed macOS Apple Silicon Tauri app
+# for connecting to remote OpenClaw servers.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 2 * * *'   # daily at 02:00 UTC
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version number (e.g., 0.1.5)"
+        required: false
+        default: ""
+      skip_release:
+        description: "Skip creating a GitHub release (for testing)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-14  # M1 runner
+    timeout-minutes: 60
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          set -euo pipefail
+          
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            # Auto-increment patch version
+            LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+            LAST_VERSION=${LAST_TAG#v}
+            IFS='.' read -r major minor patch <<< "$LAST_VERSION"
+            VERSION="$major.$minor.$((patch + 1))"
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+          
+          # Update package.json and tauri.conf.json
+          jq ".version = \"$VERSION\"" package.json > package.json.tmp
+          mv package.json.tmp package.json
+          
+          jq ".version = \"$VERSION\"" src-tauri/tauri.conf.json > src-tauri/tauri.conf.json.tmp
+          mv src-tauri/tauri.conf.json.tmp src-tauri/tauri.conf.json
+          
+          # Update Cargo.toml
+          sed -i '' "s/^version = .*/version = \"$VERSION\"/" src-tauri/Cargo.toml
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Generate updater keys
+        id: updater_keys
+        run: |
+          set -euo pipefail
+          
+          # Install minisign
+          brew install minisign
+          
+          # Generate key pair for auto-updates
+          mkdir -p $HOME/.minisign
+          if [ ! -f "$HOME/.minisign/openclaw-build.key" ]; then
+            echo "Generating new minisign key pair..."
+            minisign -G -p $HOME/.minisign/openclaw-build.pub -s $HOME/.minisign/openclaw-build.key -W
+          fi
+          
+          # Export public key
+          PUBKEY=$(cat $HOME/.minisign/openclaw-build.pub | grep -v 'untrusted comment' | head -n1)
+          echo "updater_pubkey=$PUBKEY" >> $GITHUB_OUTPUT
+          
+          # Update tauri.conf.json with public key
+          jq ".plugins.updater.pubkey = \"$PUBKEY\"" src-tauri/tauri.conf.json > src-tauri/tauri.conf.json.tmp
+          mv src-tauri/tauri.conf.json.tmp src-tauri/tauri.conf.json
+          
+          echo "MINISIGN_KEY=$HOME/.minisign/openclaw-build.key" >> $GITHUB_ENV
+
+      - name: Install frontend dependencies
+        run: npm install
+
+      - name: Install Tauri CLI
+        run: npm install --save-dev @tauri-apps/cli
+
+      - name: Generate app icons
+        run: |
+          # Create a simple icon using ImageMagick if needed
+          # For now, we'll use Tauri's default icons
+          echo "Using default Tauri icons"
+
+      - name: Build Tauri app
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ""
+          TAURI_SIGNING_PUBLIC_KEY: ""
+        run: |
+          npm run tauri build -- --target aarch64-apple-darwin
+
+      - name: Find built artifacts
+        id: artifacts
+        run: |
+          set -euo pipefail
+          
+          DMG_PATH=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -name "*.dmg" | head -n1)
+          APP_PATH=$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name "*.app" | head -n1)
+          
+          if [ -z "$DMG_PATH" ]; then
+            echo "Error: DMG not found"
+            exit 1
+          fi
+          
+          echo "dmg_path=$DMG_PATH" >> $GITHUB_OUTPUT
+          echo "app_path=$APP_PATH" >> $GITHUB_OUTPUT
+          echo "dmg_name=$(basename $DMG_PATH)" >> $GITHUB_OUTPUT
+
+      - name: Ad-hoc sign app
+        run: |
+          set -euo pipefail
+          
+          APP_PATH="${{ steps.artifacts.outputs.app_path }}"
+          
+          if [ -d "$APP_PATH" ]; then
+            echo "Ad-hoc signing $APP_PATH..."
+            codesign --force --deep --sign - "$APP_PATH"
+            codesign -dv "$APP_PATH" || true
+          fi
+
+      - name: Generate update manifest
+        id: manifest
+        run: |
+          set -euo pipefail
+          
+          DMG_PATH="${{ steps.artifacts.outputs.dmg_path }}"
+          VERSION="${{ steps.version.outputs.version }}"
+          
+          # Sign with minisign
+          minisign -S -s $MINISIGN_KEY -m "$DMG_PATH" -x "${DMG_PATH}.sig"
+          SIGNATURE=$(cat "${DMG_PATH}.sig" | grep -v 'untrusted comment' | tail -n1)
+          
+          # Get metadata
+          FILE_SIZE=$(stat -f%z "$DMG_PATH")
+          CHECKSUM=$(shasum -a 256 "$DMG_PATH" | awk '{print $1}')
+          DMG_NAME=$(basename "$DMG_PATH")
+          
+          # Create manifest
+          cat > update-manifest.json <<EOF
+          {
+            "version": "v${VERSION}",
+            "notes": "Automated build of OpenClaw Desktop Client",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "$SIGNATURE",
+                "url": "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/${DMG_NAME}",
+                "size": $FILE_SIZE,
+                "checksum": "$CHECKSUM"
+              }
+            }
+          }
+          EOF
+          
+          cat update-manifest.json
+          echo "manifest_path=update-manifest.json" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        if: ${{ !inputs.skip_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="v${VERSION}"
+          DMG_PATH="${{ steps.artifacts.outputs.dmg_path }}"
+          DMG_NAME="${{ steps.artifacts.outputs.dmg_name }}"
+          MANIFEST_PATH="${{ steps.manifest.outputs.manifest_path }}"
+          
+          # Check if release exists
+          if gh release view "$TAG" --repo ${{ github.repository }} 2>/dev/null; then
+            echo "Release $TAG already exists, deleting..."
+            gh release delete "$TAG" --repo ${{ github.repository }} --yes
+          fi
+          
+          # Create release
+          gh release create "$TAG" \
+            --repo ${{ github.repository }} \
+            --title "OpenClaw Client v${VERSION} (macOS arm64)" \
+            --notes "## OpenClaw Desktop Client v${VERSION}
+
+          A lightweight GUI client for connecting to remote OpenClaw servers.
+
+          ### Installation
+          1. Download \`$DMG_NAME\`
+          2. Open the DMG
+          3. Drag OpenClaw.app to Applications
+          4. Right-click → Open (first launch only)
+
+          ### Features
+          - Connect to remote OpenClaw instances via HTTPS
+          - Native macOS interface
+          - Auto-update support
+          - Saves connection preferences
+
+          ### Usage
+          Enter your OpenClaw server URL (e.g., \`https://your-server.ts.net:18789\`) and click Connect.
+          " \
+            "$DMG_PATH" \
+            "$MANIFEST_PATH"
+          
+          echo "Release created: https://github.com/${{ github.repository }}/releases/tag/$TAG"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-client-macos-arm64-${{ steps.version.outputs.version }}
+          path: |
+            ${{ steps.artifacts.outputs.dmg_path }}
+            ${{ steps.manifest.outputs.manifest_path }}
+          retention-days: 30

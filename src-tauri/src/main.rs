@@ -24,14 +24,14 @@ fn main() {
                 use tauri_plugin_updater::UpdaterExt;
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    match handle.updater().check().await {
-                        Ok(Some(update)) => {
+                    if let Ok(update) = handle.updater().expect("updater unavailable").check().await {
+                        if let Some(update) = update {
                             println!("Update available: {}", update.version);
                             // Auto-download and install
                             let _ = update.download_and_install(|_, _| {}, || {}).await;
+                        } else {
+                            println!("No updates available");
                         }
-                        Ok(None) => println!("No updates available"),
-                        Err(e) => eprintln!("Failed to check for updates: {}", e),
                     }
                 });
             }

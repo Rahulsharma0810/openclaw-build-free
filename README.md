@@ -12,7 +12,7 @@ A lightweight desktop GUI client for connecting to remote OpenClaw instances. Se
 
 ## Installation
 
-1. Download the latest `.dmg` from [Releases](https://github.com/Rahulsharma0810/openclaw-build-free/releases)
+1. Download the latest `.dmg` from [Releases](../../releases)
 2. Open the DMG file
 3. Drag `OpenClaw.app` to your Applications folder
 4. **First launch**: Right-click → Open (to bypass Gatekeeper)
@@ -21,7 +21,7 @@ A lightweight desktop GUI client for connecting to remote OpenClaw instances. Se
 ## Usage
 
 1. Launch OpenClaw.app
-2. Enter your OpenClaw server URL (e.g., `https://rahuls-mac-mini.husky-tet.ts.net:18789`)
+2. Enter your OpenClaw server URL (e.g., `https://your-server.example.com:18789`)
 3. The app will connect and provide a GUI interface to your OpenClaw instance
 
 ## Auto-Updates
